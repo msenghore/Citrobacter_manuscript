@@ -1,0 +1,54 @@
+## Create Sam file then converto to BAM to avoid errors and misceleaneaous fields.
+while read -r i; do
+IFS='_' read -r -a f <<< "$i"; sbatch -p shared  -t 7200 --mem=4000 --wrap="bwa mem GATK_pre_process/Citrobacter_rodentium_ICC168.fasta $i > GATK3/$f.sam" ; done < "Read_pairs.list"
+
+#Convert sam files to bam
+for i in *.sam; do
+IFS='.' read -r -a f <<< "$i"; sbatch -p shared  -t 7200 --mem=4000 --wrap="samtools view -S -b $i > $f.bam"; done
+
+#Sort bam files
+for i in *.bam; do
+IFS='.' read -r -a f <<< "$i"; sbatch -p shared  -t 7200 --mem=4000 --wrap="samtools sort $i -o $f.s.bam"; done
+
+#Filter out records with read length less than 30
+while read -r i; do sbatch -p shared  -t 7200 --mem=4000 --wrap="$i"; done < "Drop_under30base_records.txt"
+## Example
+samtools view -h N3P13.s.bam | awk 'length($10) > 30 || $1 ~ /^@/'  | samtools view -bS > N3P13.s.f.bam
+## Comment: Adding read groups fails when there are records with zero sequence length
+
+#Assign read groups to bam files
+for i in *.f.bam; do
+IFS='.' read -r -a f <<< "$i"; sbatch -p shared  -t 7000 --mem=4000 --wrap="gatk AddOrReplaceReadGroups --INPUT $i --OUTPUT $f.s.f.rg.bam --RGLB library1 --RGPL illumina --RGPU unit1 --RGSM $f"; done
+
+### Add one liner to remove unmapped reads and reads less that 30 quality
+for i in *rg.bam; do
+sbatch -p shared  -t 7200 --mem=4000 --wrap="samtools view -F 0x04 -q 30 -b $i > $i"; done
+
+#Mark duplicates in the sorted bam files with read groups assigned
+for i in *rg.bam; do
+IFS='.' read -r -a f <<< "$i"; sbatch -p shared  -t 7200 --mem=4000 --wrap="gatk MarkDuplicates -I $i -O $f.marked.bam -M $f.metrics"; done
+
+#Perform Base recalibration
+for i in *.marked.bam; do
+IFS='.marked' read -r -a f <<< "$i"; sbatch -p shared  -t 7200 --mem=4000 --wrap="gatk BaseRecalibrator -I $i -R Citrobacter_rodentium_ICC168.fasta --known-sites ICC180_confirmed_snps.vcf -O $f.recal.table"; done
+
+#Apply Base recalibration
+for i in *marked.bam; do
+IFS='.marked' read -r -a f <<< "$i"; sbatch -p shared  -t 7000 --mem=4000 --wrap="gatk ApplyBQSR -R Citrobacter_rodentium_ICC168.fasta -I $i --bqsr-recal-file $f.recal.table -O $f.analysis.ready.bam"; done
+
+#Call haplotypes and generate a GVCF file
+for i in *analysis.ready.bam; do
+IFS='.analysis' read -r -a f <<< "$i"; sbatch -p shared  -t 7000 --mem=4000 --wrap="gatk HaplotypeCaller -R Citrobacter_rodentium_ICC168.fasta -I $i -O $f.g.vcf -ERC GVCF"; done
+
+# In parallel run Haplotype caller, but ignoring soft clipped bases
+for i in *analysis.ready.bam; do
+IFS='.analysis' read -r -a f <<< "$i"; sbatch -p shared  -t 7000 --mem=4000 --wrap="gatk HaplotypeCaller -R Citrobacter_rodentium_ICC168.fasta -I $i -O $f.noclip.g.vcf -ERC GVCF --dont-use-soft-clipped-bases"; done
+
+#Proceed with gvcf generated with soft clipping 
+#1) create a Genomics DB to merge all files
+gatk --java-options "-Xmx4g -Xms4g" GenomicsDBImport --sample-name-map N1P.list --genomicsdb-workspace-path N1P.db -L NC_013716.1:1-5346659
+
+#2)Genotype GVCFs from joint call
+gatk --java-options "-Xmx4g" GenotypeGVCFs -R ../Citrobacter_rodentium_ICC168.fasta -V gendb://N1P_genomicsdb -O N1P.cohort.vcf
+
+## To call non het SNPS, Use bcftools mpileup and then generate consensus sequence for each genome
